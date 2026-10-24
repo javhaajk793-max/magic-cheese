@@ -1,0 +1,8 @@
+{
+  "name": "Magic Cheese: Arcane Fromage",
+  "description": "Epic 3D cheese action crawler with 20 waves & 9 king bosses (waves 3, 5, 7, 9, 11, 13, 15, 17, 20), online co-op lobby & party chat, 3 heroes (Baldan, Nomio, Cheddalf), 10,000x Cooler Overdrive, and retro Arcade Jukebox.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
