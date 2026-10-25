@@ -240,11 +240,11 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                   <span
                     className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'}`}
                   />
-                  {isConnected ? 'ONLINE (P2P / Server)' : 'CONNECTING...'}
+                  {isConnected ? 'ONLINE (Global Cloud Relay)' : 'CONNECTING...'}
                 </span>
               </div>
               <p className="text-stone-400 text-[11px] hidden sm:block">
-                Vercel болон бүх төхөөрөмж дээр 4 оронтой кодоор шууд холбогдож хамтдаа тоглоно!
+                Өөр өөр интернет (Wi-Fi, 4G) болон өөр компьютерууд 4 оронтой кодоор шууд холбогдоно! (Vercel Ready)
               </p>
             </div>
           </div>
@@ -399,12 +399,12 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                 <div className="bg-stone-950/60 p-3 rounded-2xl border border-amber-900/40 text-[11px] text-stone-300 space-y-1.5">
                   <div className="flex items-center gap-1 text-amber-400 font-bold font-fantasy">
                     <Info className="w-3.5 h-3.5" />
-                    <span>Хамт тоглох заавар:</span>
+                    <span>Хамт тоглох заавар (Vercel & Олон компьютер):</span>
                   </div>
-                  <ol className="list-decimal list-inside space-y-0.5 text-stone-400 leading-normal font-sans">
-                    <li>Нэг тоглогч нь <b>Шинэ өрөө үүсгэх</b> дарж код авна.</li>
-                    <li>Найздаа тэр 4 оронтой кодоо явуулна.</li>
-                    <li>Нөгөө хүн нь дээрх <b>Кодоор нэгдэх</b> хэсэгт бичнэ.</li>
+                  <ol className="list-decimal list-inside space-y-1 text-stone-400 leading-normal font-sans text-[11px]">
+                    <li>Нэг тоглогч нь <b>Шинэ өрөө үүсгэх</b> дарж 4 оронтой код авна.</li>
+                    <li>Найздаа тэр 4 оронтой кодоо явуулна (эсвэл Линк хуулж явуулна).</li>
+                    <li>Найз нь өөр компьютер, өөр Wi-Fi эсвэл 4G интернетээс кодоо бичээд <b>НЭГДЭХ</b> дарна.</li>
                   </ol>
                 </div>
               </div>

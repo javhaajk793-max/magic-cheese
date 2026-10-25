@@ -1,5 +1,5 @@
 import { CharacterId } from './types';
-import Peer, { DataConnection } from 'peerjs';
+import mqtt, { MqttClient } from 'mqtt';
 
 export interface LobbyPlayer {
   id: string;
@@ -35,7 +35,7 @@ export interface GameRoom {
   inGame: boolean;
   players: Record<string, LobbyPlayer>;
   chat: ChatMessage[];
-  isP2P?: boolean;
+  isCloud?: boolean;
 }
 
 export interface RoomSummary {
@@ -47,25 +47,31 @@ export interface RoomSummary {
   inGame: boolean;
   waveMode: number;
   hostName?: string;
-  isP2P?: boolean;
+  isCloud?: boolean;
 }
 
 type EventCallback<T = any> = (data: T) => void;
 
+// Public secure WebSocket MQTT brokers with global high-availability
+const MQTT_BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+];
+
 class MultiplayerClient {
+  private mqtt: MqttClient | null = null;
   private ws: WebSocket | null = null;
   private channel: BroadcastChannel | null = null;
-  private peer: Peer | null = null;
-  private peerConnections: Map<string, DataConnection> = new Map();
-  private hostConnection: DataConnection | null = null;
+  private currentBrokerIndex = 0;
 
   public isConnected: boolean = false;
-  public isServerMode: boolean = false;
   public myPlayerId: string = '';
   public myPlayerName: string = '';
   public currentRoom: GameRoom | null = null;
   public availableRooms: RoomSummary[] = [];
-  private pollInterval: any = null;
+
+  private roomHeartbeatInterval: any = null;
+  private localRoomsCache: Map<string, { summary: RoomSummary; timestamp: number }> = new Map();
 
   private listeners: Record<string, EventCallback[]> = {
     room_list: [],
@@ -81,7 +87,7 @@ class MultiplayerClient {
   };
 
   constructor() {
-    // Restore or generate persistent player ID in sessionStorage
+    // 1. Restore or generate persistent player ID in sessionStorage
     try {
       const storedId = sessionStorage.getItem('mc_player_id');
       if (storedId) {
@@ -102,7 +108,7 @@ class MultiplayerClient {
       this.myPlayerName = 'Hero ' + this.myPlayerId.slice(-3).toUpperCase();
     }
 
-    // BroadcastChannel for instant local multi-tab sync
+    // 2. BroadcastChannel for instant local multi-tab sync
     try {
       this.channel = new BroadcastChannel('arcane_cheese_mp');
       this.channel.onmessage = (event) => {
@@ -110,19 +116,77 @@ class MultiplayerClient {
       };
     } catch (e) {}
 
-    // Initialize network: try server WebSocket first, and always prepare P2P mesh
-    this.connectServer();
-    this.initPeer();
-    this.startPolling();
+    // 3. Connect to Global Cloud WSS Relay (works across different computers & networks on Vercel)
+    this.connectCloudRelay();
+
+    // 4. Also connect to local Node WebSocket server if available (e.g. Cloud Run full-stack container)
+    this.connectLocalServer();
   }
 
-  // --- WebSocket Server Connection ---
-  public connectServer() {
+  // --- Global Cloud WSS Connection (EMQX / HiveMQ) ---
+  private connectCloudRelay() {
     if (typeof window === 'undefined') return;
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
-      return;
-    }
 
+    const brokerUrl = MQTT_BROKERS[this.currentBrokerIndex % MQTT_BROKERS.length];
+    const clientId = `mc_${this.myPlayerId}_${Math.random().toString(36).substring(2, 6)}`;
+
+    try {
+      this.mqtt = mqtt.connect(brokerUrl, {
+        clientId,
+        clean: true,
+        connectTimeout: 5000,
+        reconnectPeriod: 3000,
+        keepalive: 30,
+      });
+
+      this.mqtt.on('connect', () => {
+        this.isConnected = true;
+        this.emit('connection_change', true);
+
+        // Subscribe to global lobby room announcements
+        this.mqtt?.subscribe('magiccheese/v2/lobby/announce', { qos: 0 });
+
+        // If we are currently in a room, re-subscribe to room topics
+        if (this.currentRoom) {
+          this.subscribeToRoom(this.currentRoom.code);
+        }
+      });
+
+      this.mqtt.on('message', (topic, payload) => {
+        try {
+          const str = payload.toString();
+          const data = JSON.parse(str);
+          this.handleCloudPacket(topic, data);
+        } catch (err) {}
+      });
+
+      this.mqtt.on('error', () => {
+        // Switch to secondary broker if connection fails
+        this.currentBrokerIndex++;
+        if (this.mqtt) {
+          try {
+            this.mqtt.end(true);
+          } catch (e) {}
+        }
+        setTimeout(() => this.connectCloudRelay(), 2000);
+      });
+
+      this.mqtt.on('offline', () => {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+          this.isConnected = false;
+          this.emit('connection_change', false);
+        }
+      });
+    } catch (e) {
+      // Retry secondary broker
+      this.currentBrokerIndex++;
+      setTimeout(() => this.connectCloudRelay(), 3000);
+    }
+  }
+
+  // --- Local Server Connection (for Node.js fullstack container) ---
+  private connectLocalServer() {
+    if (typeof window === 'undefined') return;
     try {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}`;
@@ -132,24 +196,7 @@ class MultiplayerClient {
 
       ws.onopen = () => {
         this.isConnected = true;
-        this.isServerMode = true;
         this.emit('connection_change', true);
-        this.refreshRooms();
-
-        // If we were already in a server room, re-attach
-        if (this.currentRoom && !this.currentRoom.isP2P) {
-          const myChar = this.currentRoom.players[this.myPlayerId]?.characterId || 'baldan';
-          const myColor = this.currentRoom.players[this.myPlayerId]?.color || '#22c55e';
-          this.send({
-            type: 'join_room',
-            code: this.currentRoom.code,
-            roomId: this.currentRoom.id,
-            playerId: this.myPlayerId,
-            playerName: this.myPlayerName,
-            characterId: myChar,
-            color: myColor,
-          });
-        }
       };
 
       ws.onmessage = (event) => {
@@ -161,169 +208,129 @@ class MultiplayerClient {
 
       ws.onclose = () => {
         this.ws = null;
-        this.isServerMode = false;
-        // On Vercel or serverless, WebSocket will close, but P2P/WebRTC keeps the app online!
-        if (this.peer && !this.peer.destroyed) {
+        // Even if local server is down (like on Vercel), Cloud Relay keeps us online!
+        if (this.mqtt && this.mqtt.connected) {
           this.isConnected = true;
           this.emit('connection_change', true);
-        } else {
-          this.isConnected = false;
-          this.emit('connection_change', false);
         }
       };
 
       ws.onerror = () => {
         this.ws = null;
-        this.isServerMode = false;
-        if (this.peer && !this.peer.destroyed) {
-          this.isConnected = true;
-          this.emit('connection_change', true);
-        }
       };
-    } catch (e) {
-      this.isServerMode = false;
-    }
+    } catch (e) {}
   }
 
-  // --- WebRTC PeerJS Mesh for Vercel & Serverless ---
-  private initPeer() {
-    try {
-      if (this.peer && !this.peer.destroyed) return;
-      const peerId = 'mc_usr_' + this.myPlayerId;
-      this.peer = new Peer(peerId, {
-        debug: 0,
-      });
-
-      this.peer.on('open', () => {
-        this.isConnected = true;
-        this.emit('connection_change', true);
-      });
-
-      this.peer.on('connection', (conn) => {
-        this.handleIncomingPeerConnection(conn);
-      });
-
-      this.peer.on('error', (err) => {
-        // If peerId was already taken (e.g. reload), initialize with random ID
-        if (err.type === 'unavailable-id') {
-          this.peer = new Peer({ debug: 0 });
-          this.peer.on('open', () => {
-            this.isConnected = true;
-            this.emit('connection_change', true);
-          });
-          this.peer.on('connection', (conn) => this.handleIncomingPeerConnection(conn));
-        }
-      });
-    } catch (e) {
-      // Graceful fallback to BroadcastChannel
-      this.isConnected = true;
-      this.emit('connection_change', true);
-    }
+  // Subscribe to room topics when entering a room
+  private subscribeToRoom(code: string) {
+    if (!this.mqtt || !this.mqtt.connected) return;
+    const clean = code.toUpperCase();
+    this.mqtt.subscribe(`magiccheese/v2/room/${clean}/broadcast`, { qos: 0 });
+    this.mqtt.subscribe(`magiccheese/v2/room/${clean}/to/${this.myPlayerId}`, { qos: 0 });
+    this.mqtt.subscribe(`magiccheese/v2/room/${clean}/join`, { qos: 0 });
   }
 
-  // Host handling an incoming connection from a guest player
-  private handleIncomingPeerConnection(conn: DataConnection) {
-    conn.on('open', () => {
-      conn.on('data', (raw: any) => {
-        try {
-          const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
-          if (!data || !data.type) return;
-
-          if (data.type === 'peer_join_request') {
-            if (!this.currentRoom) return;
-
-            const currentCount = Object.keys(this.currentRoom.players).length;
-            if (currentCount >= this.currentRoom.maxPlayers) {
-              conn.send(JSON.stringify({ type: 'error', message: 'Өрөө дүүрсэн байна! (Room is full)' }));
-              return;
-            }
-
-            const guestPlayer: LobbyPlayer = {
-              id: data.playerId,
-              name: data.playerName || `Hero ${currentCount + 1}`,
-              characterId: data.characterId || 'nomio',
-              color: data.color || '#ef4444',
-              isReady: false,
-              isHost: false,
-              ping: 25,
-            };
-
-            this.currentRoom.players[data.playerId] = guestPlayer;
-            this.peerConnections.set(data.playerId, conn);
-
-            this.currentRoom.chat.push({
-              id: 'join_' + Date.now(),
-              senderId: 'system',
-              senderName: 'Guild Master',
-              text: `${guestPlayer.name} joined the raid party via P2P!`,
-              time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-              isSystem: true,
-            });
-
-            // Send full room state back to guest
-            conn.send(JSON.stringify({
-              type: 'room_joined',
-              room: this.currentRoom,
-              yourId: data.playerId,
-            }));
-
-            // Broadcast room update to all existing peers and local tabs
-            this.broadcastP2P({ type: 'room_updated', room: this.currentRoom });
-            this.emit('room_updated', this.currentRoom);
-            this.broadcastRoomListP2P();
-          } else {
-            // Forward player packets (sync, spell, chat, update_profile) to other peers
-            this.handleMessage(data);
-            this.broadcastP2P(data, data.playerId);
-          }
-        } catch (err) {}
-      });
-
-      conn.on('close', () => {
-        for (const [pId, c] of this.peerConnections.entries()) {
-          if (c === conn) {
-            this.peerConnections.delete(pId);
-            if (this.currentRoom && this.currentRoom.players[pId]) {
-              this.currentRoom.players[pId].isDisconnected = true;
-              this.broadcastP2P({ type: 'room_updated', room: this.currentRoom });
-              this.emit('room_updated', this.currentRoom);
-              this.broadcastRoomListP2P();
-            }
-            break;
-          }
-        }
-      });
-    });
+  // Unsubscribe from room topics when leaving
+  private unsubscribeFromRoom(code: string) {
+    if (!this.mqtt || !this.mqtt.connected) return;
+    const clean = code.toUpperCase();
+    this.mqtt.unsubscribe(`magiccheese/v2/room/${clean}/broadcast`);
+    this.mqtt.unsubscribe(`magiccheese/v2/room/${clean}/to/${this.myPlayerId}`);
+    this.mqtt.unsubscribe(`magiccheese/v2/room/${clean}/join`);
   }
 
-  // Periodic polling fallback to keep rooms list alive
-  private startPolling() {
-    if (this.pollInterval) clearInterval(this.pollInterval);
-    this.pollInterval = setInterval(async () => {
-      if (this.currentRoom) {
-        if (!this.currentRoom.isP2P && this.isServerMode) {
-          try {
-            const res = await fetch(`/api/rooms/${this.currentRoom.id}`);
-            if (res.ok) {
-              const data = await res.json();
-              if (data.success && data.room) {
-                const prevInGame = this.currentRoom.inGame;
-                this.currentRoom = data.room;
-                this.emit('room_updated', data.room);
-                if (!prevInGame && data.room.inGame) {
-                  this.emit('game_started', data.room);
-                }
-              }
-            }
-          } catch (e) {}
-        } else if (this.isHost()) {
-          // If hosting P2P room, periodically announce to local tabs & storage
-          this.broadcastRoomListP2P();
-        }
-      } else {
-        this.refreshRooms();
+  // Handle incoming packets from Cloud Relay (MQTT)
+  private handleCloudPacket(topic: string, data: any) {
+    if (!data || !data.type) return;
+
+    // 1. Lobby room announcement
+    if (topic === 'magiccheese/v2/lobby/announce') {
+      if (data.room && data.room.code) {
+        this.localRoomsCache.set(data.room.code, {
+          summary: data.room,
+          timestamp: Date.now(),
+        });
+        this.pruneAndEmitRooms();
       }
-    }, 3000);
+      return;
+    }
+
+    // 2. Host receiving a join request from a guest player
+    if (topic.endsWith('/join') && data.type === 'peer_join_request') {
+      if (!this.currentRoom || !this.isHost()) return;
+      if (data.code !== this.currentRoom.code) return;
+
+      const guestId = data.playerId;
+      const currentCount = Object.keys(this.currentRoom.players).length;
+
+      if (currentCount >= this.currentRoom.maxPlayers) {
+        this.publishCloud(`magiccheese/v2/room/${this.currentRoom.code}/to/${guestId}`, {
+          type: 'error',
+          message: 'Өрөө дүүрсэн байна! (Room is already full - 4/4)',
+        });
+        return;
+      }
+
+      // Add guest to room
+      const guestPlayer: LobbyPlayer = {
+        id: guestId,
+        name: data.playerName || `Hero ${currentCount + 1}`,
+        characterId: data.characterId || 'nomio',
+        color: data.color || '#ef4444',
+        isReady: false,
+        isHost: false,
+        ping: 22,
+        isDisconnected: false,
+      };
+
+      this.currentRoom.players[guestId] = guestPlayer;
+      this.currentRoom.chat.push({
+        id: 'join_' + Date.now(),
+        senderId: 'system',
+        senderName: 'Guild Master',
+        text: `${guestPlayer.name} joined the raid party!`,
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        isSystem: true,
+      });
+
+      // Send room_joined directly to the new guest
+      this.publishCloud(`magiccheese/v2/room/${this.currentRoom.code}/to/${guestId}`, {
+        type: 'room_joined',
+        room: this.currentRoom,
+        yourId: guestId,
+      });
+
+      // Broadcast room update to everyone in room
+      this.publishCloud(`magiccheese/v2/room/${this.currentRoom.code}/broadcast`, {
+        type: 'room_updated',
+        room: this.currentRoom,
+      });
+
+      this.emit('room_updated', this.currentRoom);
+      return;
+    }
+
+    // 3. Regular room event packets (room_updated, chat, sync, spells, game_started)
+    // Ignore echo of our own player movements/spells
+    if (data.playerId === this.myPlayerId && (data.type === 'player_sync' || data.type === 'player_spell')) {
+      return;
+    }
+
+    this.handleMessage(data);
+  }
+
+  private pruneAndEmitRooms() {
+    const now = Date.now();
+    const active: RoomSummary[] = [];
+    for (const [code, entry] of this.localRoomsCache.entries()) {
+      if (now - entry.timestamp < 15000) {
+        active.push(entry.summary);
+      } else {
+        this.localRoomsCache.delete(code);
+      }
+    }
+    this.availableRooms = active;
+    this.emit('room_list', active);
   }
 
   private handleMessage(data: any) {
@@ -331,8 +338,7 @@ class MultiplayerClient {
 
     switch (data.type) {
       case 'room_list': {
-        const serverRooms = data.rooms || [];
-        this.availableRooms = serverRooms;
+        this.availableRooms = data.rooms || [];
         this.emit('room_list', this.availableRooms);
         break;
       }
@@ -343,6 +349,7 @@ class MultiplayerClient {
           if (data.room?.code) sessionStorage.setItem('mc_room_code', data.room.code);
           if (data.room?.id) sessionStorage.setItem('mc_room_id', data.room.id);
         } catch (e) {}
+        this.subscribeToRoom(data.room.code);
         this.emit('room_joined', data.room);
         break;
       }
@@ -392,24 +399,20 @@ class MultiplayerClient {
     }
   }
 
-  // Multi-transport send: WebSocket + WebRTC Peers + BroadcastChannel
+  // Multi-transport publish (Cloud MQTT + Local WebSocket + BroadcastChannel)
   private send(data: any) {
     const payload = JSON.stringify(data);
 
-    // 1. WebSocket if available
+    // 1. Cloud Relay
+    if (this.currentRoom && this.mqtt && this.mqtt.connected) {
+      this.publishCloud(`magiccheese/v2/room/${this.currentRoom.code}/broadcast`, data);
+    }
+
+    // 2. Local WebSocket
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
         this.ws.send(payload);
       } catch (e) {}
-    }
-
-    // 2. PeerJS connections
-    if (this.hostConnection && this.hostConnection.open) {
-      try {
-        this.hostConnection.send(payload);
-      } catch (e) {}
-    } else {
-      this.broadcastP2P(data);
     }
 
     // 3. Local BroadcastChannel
@@ -420,42 +423,10 @@ class MultiplayerClient {
     }
   }
 
-  private broadcastP2P(data: any, excludePlayerId?: string) {
-    const payload = JSON.stringify(data);
-    for (const [pId, conn] of this.peerConnections.entries()) {
-      if (pId !== excludePlayerId && conn.open) {
-        try {
-          conn.send(payload);
-        } catch (e) {}
-      }
-    }
-  }
-
-  private broadcastRoomListP2P() {
-    if (!this.currentRoom) return;
-    const summary: RoomSummary = {
-      id: this.currentRoom.id,
-      code: this.currentRoom.code,
-      name: this.currentRoom.name,
-      playerCount: Object.keys(this.currentRoom.players).length,
-      maxPlayers: this.currentRoom.maxPlayers,
-      inGame: this.currentRoom.inGame,
-      waveMode: this.currentRoom.waveMode,
-      hostName: this.currentRoom.players[this.currentRoom.hostId]?.name || 'Archmage',
-      isP2P: true,
-    };
-
-    if (this.channel) {
-      try {
-        this.channel.postMessage({ type: 'p2p_room_announce', room: summary });
-      } catch (e) {}
-    }
-
+  private publishCloud(topic: string, data: any) {
+    if (!this.mqtt || !this.mqtt.connected) return;
     try {
-      localStorage.setItem('mc_active_p2p_room', JSON.stringify({
-        room: summary,
-        timestamp: Date.now(),
-      }));
+      this.mqtt.publish(topic, JSON.stringify(data), { qos: 0 });
     } catch (e) {}
   }
 
@@ -485,7 +456,7 @@ class MultiplayerClient {
   // --- Actions ---
 
   public async refreshRooms() {
-    // 1. Try REST fetch if server exists
+    // 1. Try local Node server if available
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 1200);
@@ -494,37 +465,18 @@ class MultiplayerClient {
 
       if (res.ok) {
         const json = await res.json();
-        if (json.success && Array.isArray(json.rooms)) {
+        if (json.success && Array.isArray(json.rooms) && json.rooms.length > 0) {
           this.availableRooms = json.rooms;
           this.emit('room_list', this.availableRooms);
           return;
         }
       }
-    } catch (e) {
-      // Serverless or Vercel static mode
-    }
-
-    // 2. Discover local P2P announced rooms from localStorage
-    try {
-      const stored = localStorage.getItem('mc_active_p2p_room');
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (Date.now() - parsed.timestamp < 30000 && parsed.room) {
-          const list = [parsed.room];
-          this.availableRooms = list;
-          this.emit('room_list', list);
-          return;
-        }
-      }
     } catch (e) {}
 
-    // 3. WS fallback if connected
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.send({ type: 'list_rooms' });
-    }
+    // 2. Discover rooms from cloud relay cache
+    this.pruneAndEmitRooms();
   }
 
-  // Generate 4-letter memorable code
   private generateRoomCode(): string {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let code = '';
@@ -534,66 +486,15 @@ class MultiplayerClient {
     return code;
   }
 
-  // Fail-safe room creation: Works on Vercel, serverless, Cloud Run, and offline!
+  // Create Room: Works 100% on Vercel, different computers, same Wi-Fi, and anywhere!
   public async createRoom(
     roomName: string,
     maxPlayers: number,
     characterId: CharacterId,
     color: string
   ): Promise<GameRoom | null> {
-    // 1. First attempt REST creation (for Node.js full-stack container)
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 1400);
-
-      const res = await fetch('/api/rooms/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          roomName: roomName || 'Arcane Raid Team',
-          maxPlayers,
-          characterId,
-          color,
-          playerName: this.myPlayerName,
-          playerId: this.myPlayerId,
-        }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data.success && data.room) {
-          this.currentRoom = data.room;
-          try {
-            sessionStorage.setItem('mc_room_code', data.room.code);
-            sessionStorage.setItem('mc_room_id', data.room.id);
-          } catch (e) {}
-
-          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.send({
-              type: 'join_room',
-              roomId: data.room.id,
-              code: data.room.code,
-              playerId: this.myPlayerId,
-              playerName: this.myPlayerName,
-              characterId,
-              color,
-            });
-          }
-
-          this.emit('room_joined', data.room);
-          this.refreshRooms();
-          return data.room;
-        }
-      }
-    } catch (err) {
-      // REST not available (Vercel / static hosting) -> Proceed seamlessly to P2P Cloud Mesh!
-    }
-
-    // 2. Seamless P2P / Serverless Host Mode (guarantees room creation works 100% on Vercel!)
     const code = this.generateRoomCode();
-    const roomId = 'p2p_room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
+    const roomId = 'room_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
 
     const hostPlayer: LobbyPlayer = {
       id: this.myPlayerId,
@@ -602,11 +503,11 @@ class MultiplayerClient {
       color,
       isReady: true,
       isHost: true,
-      ping: 8,
+      ping: 15,
       isDisconnected: false,
     };
 
-    const p2pRoom: GameRoom = {
+    const room: GameRoom = {
       id: roomId,
       code,
       name: roomName || 'Arcane Raid Team',
@@ -615,20 +516,20 @@ class MultiplayerClient {
       waveMode: 20,
       inGame: false,
       players: { [this.myPlayerId]: hostPlayer },
-      isP2P: true,
+      isCloud: true,
       chat: [
         {
           id: 'sys_' + Date.now(),
           senderId: 'system',
           senderName: 'Guild Master',
-          text: `Party Lobby created! Room Code: ${code}. Share with friends to raid together!`,
+          text: `Party Lobby created! Room Code: ${code}. Share with friends on any computer/Wi-Fi to raid together!`,
           time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
           isSystem: true,
         },
       ],
     };
 
-    this.currentRoom = p2pRoom;
+    this.currentRoom = room;
     this.isConnected = true;
     this.emit('connection_change', true);
 
@@ -637,32 +538,50 @@ class MultiplayerClient {
       sessionStorage.setItem('mc_room_id', roomId);
     } catch (e) {}
 
-    // Host opens a WebRTC channel listening on room code
-    this.setupP2PHost(code);
+    // Subscribe to room topics on Cloud Relay
+    this.subscribeToRoom(code);
 
-    // Announce to local tabs and storage
-    this.broadcastRoomListP2P();
-    this.emit('room_joined', p2pRoom);
-    return p2pRoom;
+    // Start periodic heartbeat so other computers discover the room in their lobby list
+    if (this.roomHeartbeatInterval) clearInterval(this.roomHeartbeatInterval);
+    this.roomHeartbeatInterval = setInterval(() => {
+      if (!this.currentRoom || !this.isHost()) {
+        clearInterval(this.roomHeartbeatInterval);
+        return;
+      }
+      const summary: RoomSummary = {
+        id: this.currentRoom.id,
+        code: this.currentRoom.code,
+        name: this.currentRoom.name,
+        playerCount: Object.keys(this.currentRoom.players).length,
+        maxPlayers: this.currentRoom.maxPlayers,
+        inGame: this.currentRoom.inGame,
+        waveMode: this.currentRoom.waveMode,
+        hostName: this.currentRoom.players[this.currentRoom.hostId]?.name || 'Archmage',
+        isCloud: true,
+      };
+      this.publishCloud('magiccheese/v2/lobby/announce', { room: summary });
+    }, 2500);
+
+    // Also inform local Node server if running
+    fetch('/api/rooms/create', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        roomName,
+        maxPlayers,
+        characterId,
+        color,
+        playerName: this.myPlayerName,
+        playerId: this.myPlayerId,
+        code,
+      }),
+    }).catch(() => {});
+
+    this.emit('room_joined', room);
+    return room;
   }
 
-  // Set up Host Peer for room code
-  private setupP2PHost(code: string) {
-    try {
-      const roomPeerId = 'mc_host_' + code.toLowerCase();
-      const hostPeer = new Peer(roomPeerId, { debug: 0 });
-
-      hostPeer.on('connection', (conn) => {
-        this.handleIncomingPeerConnection(conn);
-      });
-
-      hostPeer.on('error', () => {
-        // If roomPeerId unavailable, normal peer already handles peer-to-peer
-      });
-    } catch (e) {}
-  }
-
-  // Join Room: Works via REST server or P2P WebRTC / BroadcastChannel
+  // Join Room: Connects across DIFFERENT computers, DIFFERENT Wi-Fi, or SAME Wi-Fi on Vercel
   public async joinRoom(
     codeOrId: string,
     characterId: CharacterId,
@@ -677,12 +596,61 @@ class MultiplayerClient {
 
     const cleanCode = rawInput.toUpperCase().replace(/\s+/g, '');
 
-    // 1. First attempt REST server join
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 1400);
+    // 1. Subscribe to Cloud Relay topics for this room code
+    this.subscribeToRoom(cleanCode);
 
-      const res = await fetch('/api/rooms/join', {
+    return new Promise((resolve) => {
+      let resolved = false;
+
+      const finishJoin = (room: GameRoom) => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(joinTimeout);
+        this.currentRoom = room;
+        try {
+          sessionStorage.setItem('mc_room_code', room.code);
+          sessionStorage.setItem('mc_room_id', room.id);
+        } catch (e) {}
+        this.emit('room_joined', room);
+        resolve({ success: true });
+      };
+
+      // Listen for direct room_joined packet from Host via Cloud Relay
+      const unsubJoined = this.on('room_joined', (room: GameRoom) => {
+        if (room && room.code.toUpperCase() === cleanCode) {
+          unsubJoined();
+          finishJoin(room);
+        }
+      });
+
+      // Send join request via Cloud Relay (reaches Host on ANY computer across the internet)
+      const sendJoinRequest = () => {
+        const payload = {
+          type: 'peer_join_request',
+          code: cleanCode,
+          playerId: this.myPlayerId,
+          playerName: this.myPlayerName,
+          characterId,
+          color,
+        };
+
+        // Publish to Cloud Relay
+        this.publishCloud(`magiccheese/v2/room/${cleanCode}/join`, payload);
+
+        // Also publish to local BroadcastChannel (for same-machine multi-tab)
+        if (this.channel) {
+          try {
+            this.channel.postMessage(payload);
+          } catch (e) {}
+        }
+      };
+
+      // Send immediately and retry once after 1 second
+      sendJoinRequest();
+      const retryTimer = setTimeout(sendJoinRequest, 1000);
+
+      // Also try local Node server in parallel if available
+      fetch('/api/rooms/join', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -693,114 +661,26 @@ class MultiplayerClient {
           characterId,
           color,
         }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-
-      if (res.ok) {
-        const data = await res.json();
-        if (data.success && data.room) {
-          this.currentRoom = data.room;
-          try {
-            sessionStorage.setItem('mc_room_code', data.room.code);
-            sessionStorage.setItem('mc_room_id', data.room.id);
-          } catch (e) {}
-
-          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.send({
-              type: 'join_room',
-              code: data.room.code,
-              roomId: data.room.id,
-              playerId: this.myPlayerId,
-              playerName: this.myPlayerName,
-              characterId,
-              color,
-            });
+      })
+        .then((res) => res.json())
+        .then((data) => {
+          if (data && data.success && data.room) {
+            clearTimeout(retryTimer);
+            finishJoin(data.room);
           }
+        })
+        .catch(() => {});
 
-          this.emit('room_joined', data.room);
-          return { success: true };
-        } else if (data.error) {
-          this.emit('error', data.error);
-          return { success: false, error: data.error };
-        }
-      }
-    } catch (e) {
-      // Server not reachable (Vercel static deploy) -> Fallback to P2P Join!
-    }
-
-    // 2. P2P Join via WebRTC
-    return new Promise((resolve) => {
-      try {
-        if (!this.peer || this.peer.destroyed) {
-          this.initPeer();
-        }
-
-        const hostPeerId = 'mc_host_' + cleanCode.toLowerCase();
-        const conn = this.peer!.connect(hostPeerId, {
-          reliable: true,
-        });
-
-        this.hostConnection = conn;
-
-        const timeout = setTimeout(() => {
-          // If WebRTC direct connect timed out, check local storage / BroadcastChannel
-          try {
-            const stored = localStorage.getItem('mc_active_p2p_room');
-            if (stored) {
-              const parsed = JSON.parse(stored);
-              if (parsed.room && parsed.room.code === cleanCode) {
-                // Join via broadcast channel
-                this.channel?.postMessage({
-                  type: 'peer_join_request',
-                  code: cleanCode,
-                  playerId: this.myPlayerId,
-                  playerName: this.myPlayerName,
-                  characterId,
-                  color,
-                });
-              }
-            }
-          } catch (err) {}
-
-          const errMsg = `"${cleanCode}" кодтой өрөө олдсонгүй эсвэл хост офлайн байна. Кодоо шалгаад дахин оролдоно уу.`;
-          this.emit('error', errMsg);
-          resolve({ success: false, error: errMsg });
-        }, 3500);
-
-        conn.on('open', () => {
-          clearTimeout(timeout);
-          conn.send(JSON.stringify({
-            type: 'peer_join_request',
-            code: cleanCode,
-            playerId: this.myPlayerId,
-            playerName: this.myPlayerName,
-            characterId,
-            color,
-          }));
-
-          conn.on('data', (raw: any) => {
-            try {
-              const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
-              this.handleMessage(data);
-              if (data.type === 'room_joined') {
-                resolve({ success: true });
-              }
-            } catch (err) {}
-          });
-        });
-
-        conn.on('error', () => {
-          clearTimeout(timeout);
-          const errMsg = `"${cleanCode}" өрөөтэй холбогдож чадсангүй.`;
-          this.emit('error', errMsg);
-          resolve({ success: false, error: errMsg });
-        });
-      } catch (err) {
-        const errMsg = 'Сүлжээнд холбогдоход алдаа гарлаа.';
+      // Timeout after 4.5 seconds if Host is offline or code does not exist
+      const joinTimeout = setTimeout(() => {
+        clearTimeout(retryTimer);
+        unsubJoined();
+        if (resolved) return;
+        resolved = true;
+        const errMsg = `"${cleanCode}" кодтой өрөө олдсонгүй! Өрөө үүсгэгч хост өрөөгөө нээсэн эсэх болон 4 оронтой кодоо зөв бичсэн эсэхээ шалгана уу.`;
         this.emit('error', errMsg);
         resolve({ success: false, error: errMsg });
-      }
+      }, 4500);
     });
   }
 
@@ -822,22 +702,9 @@ class MultiplayerClient {
     }
 
     this.send({
-      type: 'update_profile',
-      playerId: this.myPlayerId,
-      ...params,
+      type: 'room_updated',
+      room: this.currentRoom,
     });
-
-    if (this.currentRoom && !this.currentRoom.isP2P) {
-      fetch('/api/rooms/profile', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          roomId: this.currentRoom.id,
-          playerId: this.myPlayerId,
-          ...params,
-        }),
-      }).catch(() => {});
-    }
   }
 
   public sendChat(text: string) {
@@ -856,22 +723,9 @@ class MultiplayerClient {
     this.emit('chat_received', msg);
 
     this.send({
-      type: 'chat_message',
+      type: 'chat_received',
       message: msg,
-      text: text.trim(),
     });
-
-    if (!this.currentRoom.isP2P) {
-      fetch('/api/rooms/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          roomId: this.currentRoom.id,
-          playerId: this.myPlayerId,
-          text: text.trim(),
-        }),
-      }).catch(() => {});
-    }
   }
 
   public startGame() {
@@ -880,58 +734,31 @@ class MultiplayerClient {
     this.emit('game_started', this.currentRoom);
 
     this.send({
-      type: 'start_game',
-      roomId: this.currentRoom.id,
+      type: 'game_started',
+      room: this.currentRoom,
     });
-
-    if (!this.currentRoom.isP2P) {
-      fetch('/api/rooms/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          roomId: this.currentRoom.id,
-          playerId: this.myPlayerId,
-        }),
-      }).catch(() => {});
-    }
   }
 
   public leaveRoom() {
     if (this.currentRoom) {
-      const rId = this.currentRoom.id;
+      const code = this.currentRoom.code;
+      if (this.roomHeartbeatInterval) {
+        clearInterval(this.roomHeartbeatInterval);
+        this.roomHeartbeatInterval = null;
+      }
+
+      this.unsubscribeFromRoom(code);
       this.send({
-        type: 'leave_room',
-        roomId: rId,
+        type: 'room_left',
+        roomId: this.currentRoom.id,
         playerId: this.myPlayerId,
       });
-
-      if (!this.currentRoom.isP2P) {
-        fetch('/api/rooms/leave', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            roomId: rId,
-            playerId: this.myPlayerId,
-          }),
-        }).catch(() => {});
-      }
     }
-
-    if (this.hostConnection) {
-      this.hostConnection.close();
-      this.hostConnection = null;
-    }
-
-    for (const conn of this.peerConnections.values()) {
-      conn.close();
-    }
-    this.peerConnections.clear();
 
     this.currentRoom = null;
     try {
       sessionStorage.removeItem('mc_room_code');
       sessionStorage.removeItem('mc_room_id');
-      localStorage.removeItem('mc_active_p2p_room');
     } catch (e) {}
     this.emit('room_left', null);
   }
