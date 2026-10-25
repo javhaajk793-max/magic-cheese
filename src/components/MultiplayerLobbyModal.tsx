@@ -123,7 +123,11 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
     setIsJoining(true);
     const config = CHARACTER_PRESETS[selectedCharacterId];
     mpClient.myPlayerName = playerName;
-    await mpClient.createRoom(roomNameInput, maxPlayers, selectedCharacterId, config.accentColor);
+    const room = await mpClient.createRoom(roomNameInput, maxPlayers, selectedCharacterId, config.accentColor);
+    if (room) {
+      setCurrentRoom(room);
+      setIsCreatingRoom(false);
+    }
     setIsJoining(false);
   };
 
@@ -236,11 +240,11 @@ export const MultiplayerLobbyModal: React.FC<MultiplayerLobbyModalProps> = ({
                   <span
                     className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'}`}
                   />
-                  {isConnected ? 'ONLINE' : 'CONNECTING...'}
+                  {isConnected ? 'ONLINE (P2P / Server)' : 'CONNECTING...'}
                 </span>
               </div>
               <p className="text-stone-400 text-[11px] hidden sm:block">
-                Найзтайгаа 4 оронтой кодоор нэгдэж 20 үе, 9 Хаан Боссыг хамтдаа ялаарай!
+                Vercel болон бүх төхөөрөмж дээр 4 оронтой кодоор шууд холбогдож хамтдаа тоглоно!
               </p>
             </div>
           </div>
